@@ -1,75 +1,139 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-import atexit
+import pandas as pd
 import os
+import atexit
 import tarfile
 from tempfile import TemporaryDirectory
 
-import pandas as pd
+try:
+    from pyspark.sql.types import StructType, StructField, IntegerType, StringType
+except ImportError:
+    pass  # so the environment without spark doesn't break
 
 from reco_utils.dataset.url_utils import maybe_download
+from reco_utils.common.notebook_utils import is_databricks
+
+
+URL = dict(
+    full="https://s3-eu-west-1.amazonaws.com/kaggle-display-advertising-challenge-dataset/dac.tar.gz",
+    sample="http://labs.criteo.com/wp-content/uploads/2015/04/dac_sample.tar.gz"
+)
+
+LABEL = ['label']
+INT_FIELDS = ["int{0:02d}".format(i) for i in range(13)]
+CAT_FIELDS = ["cat{0:02d}".format(i) for i in range(26)]
+HEADER = LABEL + INT_FIELDS + CAT_FIELDS
 
 
 def load_pandas_df(
-    local_cache_path=None,
-    label_col="Label",
-    numeric_cols=None,
-    categorical_cols=None,
+        size="sample",
+        local_cache_path="dac_sample.tar.gz",
+        header=None
 ):
-    """Loads the Criteo DAC dataset as pandas.DataFrame.
+    """Loads the Criteo DAC dataset as pandas.DataFrame. This function download, untar, and load the dataset.
+    The schema is:
+    <label> <integer feature 1> ... <integer feature 13> <categorical feature 1> ... <categorical feature 26>
+    More details: http://labs.criteo.com/2013/12/download-terabyte-click-logs/
+    Args:
+        size (str): Dataset size. It can be "sample" or "full".
+        local_cache_path (str): Path where to cache the tar.gz file locally
+        header (list): Dataset header names.
+    Returns:
+        pd.DataFrame: Criteo DAC sample dataset.
+    """
+    if local_cache_path is None:
+        local_cache_path = os.path.join(create_cache_dir(), 'dac.tgz')
 
-      Download the dataset from http://labs.criteo.com/wp-content/uploads/2015/04/dac_sample.tar.gz, untar, and load
+    filepath, filename = os.path.split(os.path.realpath(local_cache_path))
+    download_criteo(size=size, filename=filename, work_directory=filepath)
+    data_path = extract_criteo(size, filepath=local_cache_path)
+    return pd.read_csv(data_path, sep="\t", header=None, names=header or HEADER)
 
-      For the data, the schema is:
 
-      <label> <integer feature 1> ... <integer feature 13> <categorical feature 1> ... <categorical feature 26>
-
-      Args:
-          local_cache_path (str): Path where to cache the tar.gz file locally
-          label_col (str): The column of Label.
-          numeric_cols (list): The names of numerical features.
-          categorical_cols (list): The names of categorical features.
-      Returns:
-          pandas.DataFrame: Criteo DAC sample dataset.
-      """
-
-    if numeric_cols is None:
-        numeric_cols = ["I{}".format(i) for i in range(1, 14)]
-    if categorical_cols is None:
-        categorical_cols = ["C{}".format(i) for i in range(1, 27)]
-
-    column_names = [label_col] + numeric_cols + categorical_cols
-
-    # download and untar the data file
-    data_path = _load_datafile(local_cache_path=local_cache_path)
-
-    return pd.read_csv(
-        data_path,
-        sep="\t",
+def load_spark_df(
+        spark,
+        size="sample",
         header=None,
-        names=column_names,
-    )
+        local_cache_path=None,
+        dbfs_datapath="dbfs:/FileStore/dac",
+        dbutils=None,
+):
+    """Loads the Criteo DAC dataset as pySpark.DataFrame.
+    The schema is:
+    <label> <integer feature 1> ... <integer feature 13> <categorical feature 1> ... <categorical feature 26>
+    More details: http://labs.criteo.com/2013/12/download-terabyte-click-logs/
+    Args:
+        spark (pySpark.SparkSession): Spark session
+        size (str): Dataset size. It can be "sample" or "full"
+        local_cache_path (str or None): Path where to cache the tar.gz file locally, optional
+        header (list): Dataset header names, optional
+        dbfs_datapath (str): Where to store the extracted files on Databricks
+        dbutils (Databricks.dbutils): Databricks utility object
 
-
-def _load_datafile(local_cache_path=None):
-    """ Download and extract file """
+    Returns:
+        pySpark.DataFrame: Criteo DAC training dataset.
+    """
 
     if local_cache_path is None:
-        tmp_dir = TemporaryDirectory()
-        local_cache_path = os.path.join(tmp_dir.name, 'dac_sample.tar.gz')
-        atexit.register(tmp_dir.cleanup)
+        local_cache_path = os.path.join(create_cache_dir(), 'dac.tgz')
 
-    path, filename = os.path.split(os.path.realpath(local_cache_path))
+    filepath, filename = os.path.split(os.path.realpath(local_cache_path))
+    download_criteo(size=size, filename=filename, work_directory=filepath)
+    data_path = extract_criteo(size=size, filepath=local_cache_path)
 
-    # download if it doesn't already exist locally
-    maybe_download(
-        "http://labs.criteo.com/wp-content/uploads/2015/04/dac_sample.tar.gz",
-        filename,
-        work_directory=path,
-    )
+    if is_databricks():
+        if dbutils is None:
+            raise ValueError(
+                "To use on a Databricks notebook, dbutils object should be passed as an argument"
+            )
+        # needs to be on dbfs to load
+        dbutils.fs.cp("file:{}".format(data_path), dbfs_datapath, recurse=True)
+        data_path = dbfs_datapath
 
-    with tarfile.open(local_cache_path) as tar:
-        tar.extract("dac_sample.txt", path)
+    # create schema
+    fields = [StructField(header[i], IntegerType()) for i in range(len(INT_FIELDS))]
+    fields += [StructField(header[i], StringType()) for i in range(len(CAT_FIELDS))]
+    schema = StructType(fields)
 
-    return os.path.join(path, "dac_sample.txt")
+    return spark.read.csv(data_path, schema=schema, sep="\t", header=False)
+
+
+def download_criteo(size="sample", filename="dac.tgz", work_directory="."):
+    """Download criteo dataset as a compressed file.
+    Args:
+        size (str): Size of criteo dataset. It can be "full" or "sample"
+        filename (str): Filename
+        work_directory (str): Working directory
+    Returns:
+        str: Path of the downloaded file
+    """
+    return maybe_download(URL[size.lower()], filename, work_directory)
+
+
+def extract_criteo(size, filepath):
+    """Extract Criteo dataset tar
+    Args:
+        size (str): Size of criteo dataset. It can be "full" or "sample"
+        filepath (str): full path to compressed file
+    """
+
+    with tarfile.open(filepath) as tar:
+        tar.extractall()
+
+    if size == 'full':
+        data_path = os.path.join(filepath, 'train.txt')
+    elif size == 'sample':
+        data_path = os.path.join(filepath, 'dac_sample.txt')
+    else:
+        raise ValueError('Invalid size option, can be one of ["sample", "full"]')
+
+    return data_path
+
+
+def create_cache_dir():
+    """Creates a cache directory and registers cleanup"""
+    tmp_dir = TemporaryDirectory()
+    atexit.register(tmp_dir.cleanup)
+    return tmp_dir.name
