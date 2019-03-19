@@ -29,7 +29,7 @@ HEADER = LABEL + INT_FIELDS + CAT_FIELDS
 
 def load_pandas_df(
         size="sample",
-        local_cache_path="dac_sample.tar.gz",
+        local_cache_path=None,
         header=None
 ):
     """Loads the Criteo DAC dataset as pandas.DataFrame. This function download, untar, and load the dataset.
@@ -43,12 +43,9 @@ def load_pandas_df(
     Returns:
         pd.DataFrame: Criteo DAC sample dataset.
     """
-    if local_cache_path is None:
-        local_cache_path = os.path.join(create_cache_dir(), 'dac.tgz')
-
-    filepath, filename = os.path.split(os.path.realpath(local_cache_path))
+    filepath, filename = handle_cache(size=size, cache_path=local_cache_path)
     download_criteo(size=size, filename=filename, work_directory=filepath)
-    data_path = extract_criteo(size, filepath=local_cache_path)
+    data_path = extract_criteo(size, filename=filename, work_directory=filepath)
     return pd.read_csv(data_path, sep="\t", header=None, names=header or HEADER)
 
 
@@ -76,12 +73,9 @@ def load_spark_df(
         pySpark.DataFrame: Criteo DAC training dataset.
     """
 
-    if local_cache_path is None:
-        local_cache_path = os.path.join(create_cache_dir(), 'dac.tgz')
-
-    filepath, filename = os.path.split(os.path.realpath(local_cache_path))
+    filepath, filename = handle_cache(size=size, cache_path=local_cache_path)
     download_criteo(size=size, filename=filename, work_directory=filepath)
-    data_path = extract_criteo(size=size, filepath=local_cache_path)
+    data_path = extract_criteo(size=size, filename=filename, work_directory=filepath)
 
     if is_databricks():
         if dbutils is None:
@@ -93,6 +87,7 @@ def load_spark_df(
         data_path = dbfs_datapath
 
     # create schema
+    header = header or HEADER
     fields = [StructField(header[i], IntegerType()) for i in range(len(INT_FIELDS))]
     fields += [StructField(header[i], StringType()) for i in range(len(CAT_FIELDS))]
     schema = StructType(fields)
@@ -112,28 +107,35 @@ def download_criteo(size="sample", filename="dac.tgz", work_directory="."):
     return maybe_download(URL[size.lower()], filename, work_directory)
 
 
-def extract_criteo(size, filepath):
+def extract_criteo(size, filename, work_directory):
     """Extract Criteo dataset tar
     Args:
         size (str): Size of criteo dataset. It can be "full" or "sample"
-        filepath (str): full path to compressed file
+        filename (str): Filename
+        work_directory (str): Working directory
     """
 
-    with tarfile.open(filepath) as tar:
-        tar.extractall()
+    with tarfile.open(os.path.join(work_directory, filename)) as tar:
+        tar.extractall(work_directory)
 
     if size == 'full':
-        data_path = os.path.join(filepath, 'train.txt')
+        data_path = os.path.join(work_directory, 'train.txt')
     elif size == 'sample':
-        data_path = os.path.join(filepath, 'dac_sample.txt')
+        data_path = os.path.join(work_directory, 'dac_sample.txt')
     else:
         raise ValueError('Invalid size option, can be one of ["sample", "full"]')
 
     return data_path
 
 
-def create_cache_dir():
-    """Creates a cache directory and registers cleanup"""
-    tmp_dir = TemporaryDirectory()
-    atexit.register(tmp_dir.cleanup)
-    return tmp_dir.name
+def handle_cache(size, cache_path=None):
+    """Creates a cache directory and registers cleanup
+    Args:
+        size (str): data size [full|sample]
+        cache_path (str): path to cache file, optional
+    """
+    if cache_path is None:
+        tmp_dir = TemporaryDirectory()
+        atexit.register(tmp_dir.cleanup)
+        cache_path = os.path.join(tmp_dir.name, os.path.basename(URL[size].lower()))
+    return os.path.split(os.path.realpath(cache_path))
