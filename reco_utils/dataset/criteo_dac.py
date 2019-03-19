@@ -89,7 +89,7 @@ def load_spark_df(
     # create schema
     header = header or HEADER
     fields = [StructField(header[i], IntegerType()) for i in range(len(INT_FIELDS))]
-    fields += [StructField(header[i], StringType()) for i in range(len(CAT_FIELDS))]
+    fields += [StructField(header[len(INT_FIELDS) + i], StringType()) for i in range(len(CAT_FIELDS))]
     schema = StructType(fields)
 
     return spark.read.csv(data_path, schema=schema, sep="\t", header=False)
@@ -139,3 +139,4 @@ def handle_cache(size, cache_path=None):
         atexit.register(tmp_dir.cleanup)
         cache_path = os.path.join(tmp_dir.name, os.path.basename(URL[size].lower()))
     return os.path.split(os.path.realpath(cache_path))
+
